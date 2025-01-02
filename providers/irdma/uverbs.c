@@ -660,6 +660,9 @@ static inline int get_cq_size(int ncqe, __u8 hw_rev, bool cqe_64byte_ena)
 	if (!cqe_64byte_ena && hw_rev > IRDMA_GEN_1)
 		ncqe *= 2;
 
+	if (ncqe & 1)
+		ncqe += 1; /* cq size must be an even number */
+
 	if (ncqe < IRDMA_U_MINCQ_SIZE)
 		ncqe = IRDMA_U_MINCQ_SIZE;
 
