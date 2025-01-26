@@ -626,6 +626,7 @@ struct ibv_srq *irdma_ucreate_srq(struct ibv_pd *pd,
 	if (ret)
 		goto err_srq_init;
 
+	iwusrq->srq.lock = &iwusrq->lock.lock;
 	attr->max_wr = (depth - IRDMA_RQ_RSVD) >> shift;
 
 	return &iwusrq->v_srq.srq;

@@ -1495,7 +1495,11 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 		} else {
 			info->stag_invalid_set = false;
 		}
+		ret_code = pthread_spin_lock(srq->lock);
+		if (ret_code)
+			return ret_code;
 		IRDMA_RING_MOVE_TAIL(srq->srq_ring);
+		pthread_spin_unlock(srq->lock);
 		pring = &srq->srq_ring;
 	} else if (info->q_type == IRDMA_CQE_QTYPE_RQ && !is_srq) {
 		__u32 array_idx;
