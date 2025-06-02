@@ -274,6 +274,7 @@ __le64 *irdma_qp_get_next_send_wqe(struct irdma_qp_uk *qp, __u32 *wqe_idx,
 	qp->sq_wrtrk_array[*wqe_idx].wrid = info->wr_id;
 	qp->sq_wrtrk_array[*wqe_idx].wr_len = total_size;
 	qp->sq_wrtrk_array[*wqe_idx].quanta = wqe_quanta;
+	qp->sq_wrtrk_array[*wqe_idx].signaled = info->signaled;
 	if (qp->uk_attrs->feature_flags & IRDMA_FEATURE_ENFORCE_SQ_SIZE) {
 		atomic_fetch_add(&qp->sq_ring.post_cnt, 1);
 		if (info->signaled) {
@@ -1559,6 +1560,10 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 			info->wr_id = qp->sq_wrtrk_array[wqe_idx].wrid;
 			if (!info->comp_status)
 				info->bytes_xfered = qp->sq_wrtrk_array[wqe_idx].wr_len;
+			if (!qp->sq_wrtrk_array[wqe_idx].signaled) {
+				ret_code = ENOENT;
+				goto exit;
+			}
 			if (irdma_check_sq_cqe(qp, &wqe_idx)) {
 				info->wr_id = qp->sq_wrtrk_array[wqe_idx].wrid;
 				info->comp_status = IRDMA_COMPL_STATUS_UNKNOWN;
@@ -1591,6 +1596,9 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 					      &wqe_qword);
 				info->op_type = (__u8)FIELD_GET(IRDMAQPSQ_OPCODE,
 							      wqe_qword);
+				if (qp->uk_attrs->feature_flags & IRDMA_FEATURE_ENFORCE_SQ_SIZE)
+					atomic_fetch_sub(&qp->sq_ring.post_cnt,
+							 qp->sq_sigwrtrk_array[tail].post_cnt);
 				IRDMA_RING_SET_TAIL(qp->sq_ring,
 						    tail + qp->sq_wrtrk_array[tail].quanta);
 				if (info->op_type != IRDMAQP_OP_NOP) {
