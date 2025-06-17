@@ -275,6 +275,10 @@ __le64 *irdma_qp_get_next_send_wqe(struct irdma_qp_uk *qp, __u32 *wqe_idx,
 	qp->sq_wrtrk_array[*wqe_idx].wr_len = total_size;
 	qp->sq_wrtrk_array[*wqe_idx].quanta = wqe_quanta;
 	qp->sq_wrtrk_array[*wqe_idx].signaled = info->signaled;
+#ifdef UD_CREDIT_API
+	qp->sq_wrtrk_array[*wqe_idx].ud_suppress_completion = false;
+	qp->sq_wrtrk_array[*wqe_idx].ud_credit_acquired = false;
+#endif /* UD_CREDIT_API */
 	if (qp->uk_attrs->feature_flags & IRDMA_FEATURE_ENFORCE_SQ_SIZE) {
 		atomic_fetch_add(&qp->sq_ring.post_cnt, 1);
 		if (info->signaled) {
@@ -737,7 +741,12 @@ int irdma_uk_send(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, &quanta, total_size, info);
 	if (!wqe)
 		return ENOMEM;
-
+#ifdef UD_CREDIT_API
+	qp->sq_wrtrk_array[wqe_idx].ud_suppress_completion =
+		info->ud_suppress_completion;
+	qp->sq_wrtrk_array[wqe_idx].ud_credit_acquired =
+		info->ud_credit_acquired;
+#endif /* UD_CREDIT_API */
 	read_fence |= info->read_fence;
 	addl_frag_cnt = frag_cnt > 1 ? (frag_cnt - 1) : 0;
 	if (info->imm_data_valid) {
@@ -1050,7 +1059,12 @@ int irdma_uk_inline_send(struct irdma_qp_uk *qp,
 	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, &quanta, total_size, info);
 	if (!wqe)
 		return ENOMEM;
-
+#ifdef UD_CREDIT_API
+	qp->sq_wrtrk_array[wqe_idx].ud_suppress_completion =
+		info->ud_suppress_completion;
+	qp->sq_wrtrk_array[wqe_idx].ud_credit_acquired =
+		info->ud_credit_acquired;
+#endif /* UD_CREDIT_API */
 	set_64bit_val(wqe, 16,
 		      FIELD_PREP(IRDMAQPSQ_DESTQKEY, op_info->qkey) |
 		      FIELD_PREP(IRDMAQPSQ_DESTQPN, op_info->dest_qp));
@@ -1538,6 +1552,12 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 		}
 		pring = &qp->rq_ring;
 	} else { /* q_type is IRDMA_CQE_QTYPE_SQ */
+#ifdef UD_CREDIT_API
+		info->ud_suppress_completion =
+			qp->sq_wrtrk_array[wqe_idx].ud_suppress_completion;
+		info->ud_credit_acquired =
+			qp->sq_wrtrk_array[wqe_idx].ud_credit_acquired;
+#endif /* UD_CREDIT_API */
 		if (qp->first_sq_wq) {
 			if (wqe_idx + 1 >= qp->conn_wqes)
 				qp->first_sq_wq = false;

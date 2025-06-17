@@ -68,6 +68,20 @@ struct irdma_uvcontext {
 	bool use_raw_attrs:1;
 	struct list_head pd_list;
 	struct irdma_spinlock pd_lock;
+#ifdef UD_CREDIT_API
+	pthread_spinlock_t ud_lock;
+	pthread_t ud_thread;
+	struct ibv_cq *ud_cq;
+	struct ibv_comp_channel *ud_channel;
+	/* List of UD QPs. */
+	struct list_head ud_qp_cq_list;
+	/* HW CQE free list. */
+	pthread_spinlock_t cqe_free_list_lock;
+	struct list_head cqe_free_list;
+	atomic_bool ud_credit_failure;
+	atomic_bool ud_credit_initialized;
+	atomic_bool terminate;
+#endif /* UD_CREDIT_API */
 };
 
 struct irdma_uqp;
@@ -105,6 +119,9 @@ struct irdma_ucq {
 	struct irdma_uqp *uqp;
 	struct irdma_cq_uk cq;
 	struct list_head resize_list;
+#ifdef UD_CREDIT_API
+	struct list_head ud_injection_list;
+#endif /* UD_CREDIT_API */
 	/* for extended CQ completion fields */
 	struct irdma_cq_poll_info cur_cqe;
 	struct list_node dbg_entry;
@@ -127,6 +144,11 @@ struct irdma_uqp {
 	struct irdma_qp_uk qp;
 	enum ibv_qp_type qp_type;
 	struct list_node dbg_entry;
+#ifdef UD_CREDIT_API
+	struct list_node ud_node;
+	struct ibv_cq *ud_real_cq;
+	bool on_ud_list;
+#endif /* UD_CREDIT_API */
 };
 
 struct irdma_utd {

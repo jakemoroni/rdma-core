@@ -86,6 +86,12 @@ static void irdma_ufree_context(struct ibv_context *ibctx)
 
 	iwvctx = container_of(ibctx, struct irdma_uvcontext,
 			      ibv_ctx.context);
+
+	atomic_store(&iwvctx->terminate, 1);
+	if (atomic_load(&iwvctx->ud_credit_initialized)) {
+		pthread_join(iwvctx->ud_thread, NULL);
+	}
+
 	irdma_ufree_pd(&iwvctx->iwupd->ibv_pd);
 	irdma_munmap(iwvctx->db);
 	verbs_uninit_context(&iwvctx->ibv_ctx);
@@ -250,6 +256,23 @@ retry:
 
 	ibv_pd->context = &iwvctx->ibv_ctx.context;
 	iwvctx->iwupd = container_of(ibv_pd, struct irdma_upd, ibv_pd);
+
+#ifdef UD_CREDIT_API
+	/* Gets created when the first UD QP is created because the upper
+	 * library does some additional work after this call returns and the
+	 * context may not be ready to accept a ibv_create_cq call right now.
+	 * Defer creation of the thread to reduce overhead for applications
+	 * which don't use any UD QPs at all.
+	 */
+	pthread_spin_init(&iwvctx->ud_lock, 0);
+	list_head_init(&iwvctx->ud_qp_cq_list);
+	pthread_spin_init(&iwvctx->cqe_free_list_lock, 0);
+	list_head_init(&iwvctx->cqe_free_list);
+	atomic_store(&iwvctx->ud_credit_failure, false);
+	atomic_store(&iwvctx->ud_credit_initialized, false);
+	atomic_store(&iwvctx->terminate, false);
+#endif /* UD_CREDIT_API */
+
 	return &iwvctx->ibv_ctx;
 
 err_free:

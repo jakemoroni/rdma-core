@@ -21,6 +21,113 @@
 #include "umain.h"
 #include "abi.h"
 
+#ifdef UD_CREDIT_API
+
+#include <sys/poll.h>
+
+static void ud_check_completions(struct irdma_uvcontext *iwvctx);
+
+/* Attempt to acquire a UD TX credit. Does not block.
+ * Returns false if no credits are available.
+ */
+static bool get_ud_credit(struct ibv_qp *ib_qp)
+{
+	struct ibv_post_send cmd;
+	struct ib_uverbs_post_send_resp resp;
+
+	cmd.hdr.command	= IB_USER_VERBS_CMD_POST_SEND;
+	cmd.hdr.in_words = sizeof(cmd) / 4;
+	cmd.hdr.out_words = sizeof(resp) / 4;
+	cmd.response = (uintptr_t)&resp;
+	cmd.qp_handle = ib_qp->handle;
+	cmd.wr_count = 0;
+	cmd.sge_count = 0;
+	cmd.wqe_size = sizeof(struct ibv_send_wr);
+
+	if (write(ib_qp->context->cmd_fd, &cmd, sizeof(cmd)) < 0)
+		return false;
+
+	/* Got a credit... */
+	return true;
+}
+
+/* Return a UD credit. */
+static void return_ud_credit(struct ibv_cq *ib_cq)
+{
+	struct ibv_poll_cq cmd = {};
+	const size_t out_size = sizeof(struct ib_uverbs_poll_cq_resp) +
+		sizeof(struct ib_uverbs_wc);
+	char buffer[out_size];
+
+	cmd.hdr.command	= IB_USER_VERBS_CMD_POLL_CQ;
+	cmd.hdr.in_words = sizeof(cmd) / 4;
+	cmd.hdr.out_words = out_size / 4;
+	cmd.response = (uintptr_t)buffer;
+	cmd.cq_handle = ib_cq->handle;
+	cmd.ne = 1;
+
+	if (write(ib_cq->context->cmd_fd, &cmd, sizeof(cmd)) < 0)
+		fprintf(stderr, "Program Error: Failed to return UD credit\n");
+}
+
+/* Returns true if a UD credit was obtained, false otherwise (timeout). */
+static bool try_ud_credit(struct ibv_qp *ib_qp)
+{
+	uint64_t enter;
+	uint64_t tmp;
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	enter = ts.tv_sec;
+	enter *= 1000000000;
+	enter += ts.tv_nsec;
+
+	while (true) {
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		tmp = ts.tv_sec;
+		tmp *= 1000000000;
+		tmp += ts.tv_nsec;
+
+		if (get_ud_credit(ib_qp))
+			return true;
+
+		if (tmp - enter > UD_CREDIT_TIMEOUT_NANOS)
+			return false;
+
+		/* TODO: Implement proper back-off. */
+		sched_yield();
+	}
+
+	return false;
+}
+
+/* Get a CQE from the free list or allocate a new one. */
+static struct irdma_cq_poll_info *get_free_cqe(struct irdma_uvcontext *iwvctx)
+{
+	struct irdma_cq_poll_info *info;
+
+	pthread_spin_lock(&iwvctx->cqe_free_list_lock);
+	info = list_pop(&iwvctx->cqe_free_list, struct irdma_cq_poll_info,
+			ud_node);
+	pthread_spin_unlock(&iwvctx->cqe_free_list_lock);
+
+	if (info)
+		return info;
+
+	return calloc(1, sizeof(*info));
+}
+
+/* Returns a CQE to the free list. */
+static void ud_free_cqe(struct irdma_uvcontext *iwvctx,
+			struct irdma_cq_poll_info *info)
+{
+	list_node_init(&info->ud_node);
+	pthread_spin_lock(&iwvctx->cqe_free_list_lock);
+	list_add(&iwvctx->cqe_free_list, &info->ud_node);
+	pthread_spin_unlock(&iwvctx->cqe_free_list_lock);
+}
+#endif /* UD_CREDIT_API */
+
 static int irdma_validate_pd(struct ibv_pd *pd)
 {
 	struct irdma_upd *iwupd, *next;
@@ -739,6 +846,7 @@ static struct ibv_cq_ex *ucreate_cq(struct ibv_context *context,
 	total_size = get_cq_total_bytes(info.cq_size, cqe_64byte_ena);
 	iwucq->comp_vector = attr_ex->comp_vector;
 	list_head_init(&iwucq->resize_list);
+	list_head_init(&iwucq->ud_injection_list);
 	cq_pages = total_size >> IRDMA_HW_PAGE_SHIFT;
 
 	if (!(uk_attrs->feature_flags & IRDMA_FEATURE_CQ_RESIZE))
@@ -914,6 +1022,8 @@ int irdma_udestroy_cq(struct ibv_cq *cq)
 	if (ret)
 		goto err;
 
+// delete and restore any ud injection cqes
+
 	irdma_process_resize_list(iwucq, NULL);
 	ret = ibv_cmd_destroy_cq(cq);
 	if (ret)
@@ -1063,11 +1173,12 @@ static void irdma_process_cqe(struct ibv_wc *entry, struct irdma_cq_poll_info *c
 	if (cur_cqe->error) {
 		entry->status = (cur_cqe->comp_status == IRDMA_COMPL_STATUS_FLUSHED) ?
 				irdma_flush_err_to_ib_wc_status(cur_cqe->minor_err) : IBV_WC_GENERAL_ERR;
-		entry->vendor_err = cur_cqe->major_err << 16 |
-				    cur_cqe->minor_err;
 	} else {
 		entry->status = IBV_WC_SUCCESS;
 	}
+
+	entry->vendor_err = cur_cqe->major_err << 16 |
+		cur_cqe->minor_err;
 
 	if (cur_cqe->imm_valid) {
 		entry->imm_data = htonl(cur_cqe->imm_data);
@@ -1111,18 +1222,41 @@ static void irdma_process_cqe(struct ibv_wc *entry, struct irdma_cq_poll_info *c
  *
  * Returns the internal irdma device error code or 0 on success
  */
-static int irdma_poll_one(struct irdma_cq_uk *ukcq, struct irdma_cq_poll_info *cur_cqe,
+static int irdma_poll_one(struct irdma_ucq *iwucq, struct irdma_cq_uk *ukcq,
+			  struct irdma_cq_poll_info *cur_cqe,
 			  struct ibv_wc *entry)
 {
-	int ret = irdma_uk_cq_poll_cmpl(ukcq, cur_cqe);
+	int ret = 0;
+	struct irdma_cq_poll_info *ud_cqe;
+
+	ud_cqe = list_pop(&iwucq->ud_injection_list, struct irdma_cq_poll_info,
+			  ud_node);
+	if (!ud_cqe) {
+		ret = irdma_uk_cq_poll_cmpl(ukcq, cur_cqe);
+	} else {
+		struct irdma_uvcontext *iwvctx =
+			container_of(iwucq->verbs_cq.cq.context,
+				     struct irdma_uvcontext , ibv_ctx.context);
+
+		*cur_cqe = *ud_cqe;
+		ud_free_cqe(iwvctx, ud_cqe);
+	}
 
 	if (ret)
 		return ret;
 
 	if (!entry)
 		irdma_process_cqe_ext(cur_cqe);
-	else
+	else {
+
 		irdma_process_cqe(entry, cur_cqe);
+		if (entry->vendor_err) {
+			/* TODO: Remove. */
+			printf("Received unexpected CIE (0x%08x) - "
+			       "Is the UD credit subsystem functional?\n",
+			       entry->vendor_err);
+		}
+	}
 
 	return 0;
 }
@@ -1150,7 +1284,7 @@ static int __irdma_upoll_cq(struct irdma_ucq *iwucq, int num_entries,
 	/* go through the list of previously resized CQ buffers */
 	list_for_each_safe(&iwucq->resize_list, cq_buf, next, list) {
 		while (npolled < num_entries) {
-			ret = irdma_poll_one(&cq_buf->cq, cur_cqe,
+			ret = irdma_poll_one(iwucq, &cq_buf->cq, cur_cqe,
 					     entry ? entry + npolled : NULL);
 			if (!ret) {
 				++npolled;
@@ -1175,7 +1309,7 @@ static int __irdma_upoll_cq(struct irdma_ucq *iwucq, int num_entries,
 
 	/* check the current CQ for new cqes */
 	while (npolled < num_entries) {
-		ret = irdma_poll_one(&iwucq->cq, cur_cqe,
+		ret = irdma_poll_one(iwucq, &iwucq->cq, cur_cqe,
 				     entry ? entry + npolled : NULL);
 		if (!ret) {
 			++npolled;
@@ -1223,8 +1357,13 @@ int irdma_upoll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *entry)
 {
 	struct irdma_ucq *iwucq;
 	int ret;
-
 	iwucq = container_of(cq, struct irdma_ucq, verbs_cq.cq);
+	struct irdma_uvcontext *iwvctx =
+		container_of(iwucq->verbs_cq.cq.context,
+			     struct irdma_uvcontext , ibv_ctx.context);
+
+	ud_check_completions(iwvctx);
+
 	ret = irdma_spin_lock(&iwucq->lock);
 	if (ret)
 		return -ret;
@@ -1361,7 +1500,7 @@ static uint32_t irdma_wc_read_vendor_err(struct ibv_cq_ex *ibvcq_ex)
 	iwucq = container_of(ibvcq_ex, struct irdma_ucq, verbs_cq.cq_ex);
 	cur_cqe = &iwucq->cur_cqe;
 
-	return cur_cqe->error ? cur_cqe->major_err << 16 | cur_cqe->minor_err : 0;
+	return cur_cqe->major_err << 16 | cur_cqe->minor_err;
 }
 
 static unsigned int irdma_wc_read_wc_flags(struct ibv_cq_ex *ibvcq_ex)
@@ -1680,6 +1819,199 @@ err_dereg_mr:
 	return ret;
 }
 
+#ifdef UD_CREDIT_API
+/* Returns true if a CQE was polled. */
+static bool ud_poll_one(struct irdma_ucq *iwucq,
+			struct irdma_cq_poll_info *info)
+{
+	int ret;
+
+retry_poll:
+	irdma_spin_lock(&iwucq->lock);
+	ret = irdma_uk_cq_poll_cmpl(&iwucq->cq, info);
+	irdma_spin_unlock(&iwucq->lock);
+
+	/* EFAULT indicates that the QP was deleted, so retry.
+	 * There is a chance that this completion didn't actually hold
+	 * a credit, but better to overflow than underflow.
+	 */
+	if (ret == EFAULT) {
+		return_ud_credit(&iwucq->verbs_cq.cq);
+		goto retry_poll;
+	}
+
+	return ret? false : true;
+}
+
+/* Find the "real" CQ that a CQE should be injected into. */
+static void ud_handle_cqe(struct irdma_uvcontext *iwvctx,
+			  struct irdma_cq_poll_info *info)
+{
+	bool handled = false;
+	struct irdma_uqp *qp, *qp_next;
+
+	list_for_each_safe(&iwvctx->ud_qp_cq_list, qp, qp_next, ud_node) {
+		if (qp->qp.qp_id == info->qp_id) {
+			struct irdma_ucq *real_cq =
+				container_of(qp->ud_real_cq, struct irdma_ucq,
+					     verbs_cq.cq);
+			list_node_init(&info->ud_node);
+			irdma_spin_lock(&real_cq->lock);
+			list_add_tail(&real_cq->ud_injection_list,
+				      &info->ud_node);
+			irdma_spin_unlock(&real_cq->lock);
+			handled = true;
+		}
+	}
+
+	if (!handled) {
+		ud_free_cqe(iwvctx, info);
+	}
+}
+
+/* Handles completions until there are no remaining CQEs. */
+static void ud_check_completions(struct irdma_uvcontext *iwvctx)
+{
+	struct irdma_ucq *iwucq = container_of(iwvctx->ud_cq, struct irdma_ucq,
+					       verbs_cq.cq);
+	struct irdma_cq_poll_info local;
+	struct irdma_cq_poll_info *info;
+	bool got_cqe;
+
+	if (!atomic_load(&iwvctx->ud_credit_initialized))
+		return;
+
+	pthread_spin_lock(&iwvctx->ud_lock);
+	while (true) {
+		got_cqe = ud_poll_one(iwucq, &local);
+		if (!got_cqe)
+			break;
+
+		if (local.ud_credit_acquired)
+			return_ud_credit(&iwucq->verbs_cq.cq);
+
+		/* Does this one need to be forwarded to the real CQ? */
+		if (local.ud_suppress_completion)
+			continue;
+
+		info = get_free_cqe(iwvctx);
+		if (!info) {
+			fprintf(stderr, "Could not allocate UD CQE buffer\n");
+			break;
+		}
+
+		*info = local;
+
+		/* Consumes the CQE. */
+		ud_handle_cqe(iwvctx, info);
+	}
+	pthread_spin_unlock(&iwvctx->ud_lock);
+}
+
+static void *ud_completion_thread(void *arg)
+{
+	int tmp;
+	void *ev_ctx;
+	struct ibv_cq *event_cq;
+	struct irdma_uvcontext *iwvctx = (struct irdma_uvcontext *)arg;
+
+	while (true) {
+		if (atomic_load(&iwvctx->terminate))
+			return NULL;
+
+		/* Throttle the thread for cases where there is heavy UD traffic
+		 * and the application is already polling the CQ frequently.
+		 * TODO: Think this through - this can't be the right way...
+		 */
+		usleep(50);
+
+		/* BLOCKING - TODO MOVE TO POLL */
+		tmp = ibv_get_cq_event(iwvctx->ud_channel,
+				       &event_cq, &ev_ctx);
+		if (tmp) {
+			fprintf(stderr,
+				"Failed to get CQ event %d, %d\n", tmp, errno);
+			continue;
+		}
+
+		if (event_cq != iwvctx->ud_cq) {
+			fprintf(stderr, "Got event for invalid Cq\n");
+			ibv_ack_cq_events(event_cq, 1);
+			continue;
+		}
+
+		ibv_ack_cq_events(event_cq, 1);
+
+		ibv_req_notify_cq(iwvctx->ud_cq, 0);
+
+		ud_check_completions(iwvctx);
+	}
+
+	return NULL;
+}
+
+/* Check to see if the UD credit mechanism has been initiailized, and
+ * initialize it if not.
+ * Lock must be held.
+ */
+static void ud_credit_check_init(struct irdma_uvcontext *iwvctx)
+{
+	size_t i;
+	struct irdma_cq_poll_info *info;
+
+	if (atomic_load(&iwvctx->ud_credit_failure) ||
+	    atomic_load(&iwvctx->ud_credit_initialized))
+		return;
+
+	printf("Initializing UD credit system\n");
+
+	info = calloc(UD_CREDIT_CQ_SIZE, sizeof(struct irdma_cq_poll_info));
+	if (!info) {
+		fprintf(stderr, "Failed to allocate UD CQEs\n");
+		atomic_store(&iwvctx->ud_credit_failure, true);
+		return;
+	}
+
+	for (i = 0; i < UD_CREDIT_CQ_SIZE; i++) {
+		list_node_init(&info[i].ud_node);
+		list_add(&iwvctx->cqe_free_list, &info[i].ud_node);
+	}
+
+	iwvctx->ud_channel = ibv_create_comp_channel(&iwvctx->ibv_ctx.context);
+	if (!iwvctx->ud_channel) {
+		atomic_store(&iwvctx->ud_credit_failure, true);
+		free(info);
+		fprintf(stderr, "Failed to create UD completion channel\n");
+		return;
+	}
+
+	iwvctx->ud_cq = irdma_ucreate_cq(&iwvctx->ibv_ctx.context,
+					 UD_CREDIT_CQ_SIZE, iwvctx->ud_channel,
+					 0);
+	if (!iwvctx->ud_cq) {
+		atomic_store(&iwvctx->ud_credit_failure, true);
+		ibv_destroy_comp_channel(iwvctx->ud_channel);
+		free(info);
+		fprintf(stderr, "Failed to create UD completion queue\n");
+		return;
+	}
+
+	ibv_req_notify_cq(iwvctx->ud_cq, 0);
+
+	if (pthread_create(&iwvctx->ud_thread, NULL, ud_completion_thread,
+			   iwvctx)) {
+		atomic_store(&iwvctx->ud_credit_failure, true);
+		irdma_udestroy_cq(iwvctx->ud_cq);
+		ibv_destroy_comp_channel(iwvctx->ud_channel);
+		free(info);
+		fprintf(stderr, "Failed to create UD completion thread\n");
+		return;
+	}
+
+	atomic_store(&iwvctx->ud_credit_initialized, true);
+}
+#endif /* UD_CREDIT_API */
+
 /**
  * irdma_ucreate_qp - create qp on user app
  * @pd: pd for the qp
@@ -1693,7 +2025,10 @@ struct ibv_qp *irdma_ucreate_qp(struct ibv_pd *pd,
 	struct irdma_uvcontext *iwvctx;
 	struct irdma_uqp *iwuqp;
 	int status;
-
+#ifdef UD_CREDIT_API
+	struct ibv_cq *old_cq = NULL;
+	bool ud_added = false;
+#endif
 	status = irdma_validate_pd(pd);
 	if (status) {
 		errno = status;
@@ -1709,6 +2044,21 @@ struct ibv_qp *irdma_ucreate_qp(struct ibv_pd *pd,
 
 	iwvctx = container_of(pd->context, struct irdma_uvcontext,
 			      ibv_ctx.context);
+
+#ifdef UD_CREDIT_API
+	if (attr->qp_type == IBV_QPT_UD) {
+		pthread_spin_lock(&iwvctx->ud_lock);
+		ud_credit_check_init(iwvctx);
+		if (iwvctx->ud_credit_initialized) {
+			old_cq = attr->send_cq;
+			/* Temporarily override the send CQ. */
+			attr->send_cq = iwvctx->ud_cq;
+			ud_added = true;
+		}
+		pthread_spin_unlock(&iwvctx->ud_lock);
+	}
+#endif /* UD_CREDIT_API */
+
 	uk_attrs = &iwvctx->uk_attrs;
 
 	if (attr->srq) {
@@ -1824,7 +2174,19 @@ struct ibv_qp *irdma_ucreate_qp(struct ibv_pd *pd,
 	pthread_mutex_lock(&sigusr1_wait_mutex);
 	list_add(&dbg_uqp_list, &iwuqp->dbg_entry);
 	pthread_mutex_unlock(&sigusr1_wait_mutex);
-
+#ifdef UD_CREDIT_API
+	if (attr->qp_type == IBV_QPT_UD) {
+		if (ud_added) {
+			attr->send_cq = old_cq;
+			list_node_init(&iwuqp->ud_node);
+			iwuqp->ud_real_cq = old_cq;
+			pthread_spin_lock(&iwvctx->ud_lock);
+			list_add(&iwvctx->ud_qp_cq_list, &iwuqp->ud_node);
+			pthread_spin_unlock(&iwvctx->ud_lock);
+			iwuqp->on_ud_list = true;
+		}
+	}
+#endif
 	return &iwuqp->ibv_qp;
 
 err_free_vmap_qp:
@@ -1958,6 +2320,24 @@ int irdma_udestroy_qp(struct ibv_qp *qp)
 	int ret;
 
 	iwuqp = container_of(qp, struct irdma_uqp, ibv_qp);
+
+#ifdef UD_CREDIT_API
+	/* The "actual" CQ cannot be deleted until after the QP is deleted,
+	 * so removing the QP from the UD list now ensures that the UD thread
+	 * will never try to add a CQE to the injection list of a defunct CQ.
+	 */
+	{
+		struct irdma_uvcontext *iwvctx =
+			container_of(qp->context, struct irdma_uvcontext,
+				     ibv_ctx.context);
+		if (iwuqp->on_ud_list) {
+			pthread_spin_lock(&iwvctx->ud_lock);
+			list_del(&iwuqp->ud_node);
+			pthread_spin_unlock(&iwvctx->ud_lock);
+		}
+	}
+#endif /* UD_CREDIT_API */
+
 	pthread_mutex_lock(&sigusr1_wait_mutex);
 	list_del(&iwuqp->dbg_entry);
 	pthread_mutex_unlock(&sigusr1_wait_mutex);
@@ -2045,7 +2425,6 @@ int irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 			info.signaled = true;
 		if (ib_wr->send_flags & IBV_SEND_FENCE)
 			info.read_fence = true;
-
 		switch (ib_wr->opcode) {
 		case IBV_WR_ATOMIC_CMP_AND_SWP:
 			info.op_type = IRDMA_OP_TYPE_ATOMIC_COMPARE_AND_SWAP;
@@ -2104,6 +2483,27 @@ int irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 				info.op.send.ah_id = ah->ah_id;
 				info.op.send.qkey = ib_wr->wr.ud.remote_qkey;
 				info.op.send.dest_qp = ib_wr->wr.ud.remote_qpn;
+#ifdef UD_CREDIT_API
+				if (try_ud_credit(ib_qp)) {
+					info.ud_credit_acquired = true;
+				} else {
+					fprintf(stderr, "Could not get UD TX "
+							"credit after %u "
+							"nanoseconds\n",
+						UD_CREDIT_TIMEOUT_NANOS);
+				}
+
+				if (!info.signaled) {
+					info.signaled = true;
+					/* User wants unsignaled, but we need
+					 * all UD sends to be signalled so we
+					 * can release the credits.
+					 */
+					info.ud_suppress_completion = true;
+				}
+
+				/* TODO: Signal completion thread to give it a head start. */
+#endif /* UD_CREDIT_API */
 			}
 
 			if (ib_wr->send_flags & IBV_SEND_INLINE)

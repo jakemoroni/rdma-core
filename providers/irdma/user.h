@@ -5,6 +5,10 @@
 
 #include "osdep.h"
 
+#define UD_CREDIT_API			1
+#define UD_CREDIT_TIMEOUT_NANOS		5000000000
+#define UD_CREDIT_CQ_SIZE		8192
+
 #define irdma_handle void *
 #define irdma_adapter_handle irdma_handle
 #define irdma_qp_handle irdma_handle
@@ -376,6 +380,10 @@ struct irdma_post_sq_info {
 	bool udp_hdr:1;
 	bool defer_flag:1;
 	bool remote_atomic_en:1;
+#ifdef UD_CREDIT_API
+	bool ud_credit_acquired:1;
+	bool ud_suppress_completion:1;
+#endif /* UD_CREDIT_API */
 	__u32 imm_data;
 	__u32 stag_to_inv;
 	union {
@@ -421,6 +429,11 @@ struct irdma_cq_poll_info {
 		__u32 timestamp;
 		__u32 raw;
 	} stat;
+#ifdef UD_CREDIT_API
+	struct list_node ud_node;
+	bool ud_suppress_completion;
+	bool ud_credit_acquired;
+#endif /* UD_CREDIT_API */
 };
 
 struct qp_err_code {
@@ -521,6 +534,10 @@ struct irdma_sq_uk_wr_trk_info {
 	__u16 quanta;
 	__u8 signaled;
 	__u8 reserved[1];
+#ifdef UD_CREDIT_API
+	bool ud_suppress_completion:1;
+	bool ud_credit_acquired:1;
+#endif /* UD_CREDIT_API */
 };
 
 struct irdma_qp_quanta {
