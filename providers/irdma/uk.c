@@ -1434,6 +1434,8 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 		ret_code = EFAULT;
 		goto exit;
 	}
+	info->major_err = 0;
+	info->minor_err = 0;
 	if (info->error) {
 		info->major_err = FIELD_GET(IRDMA_CQ_MAJERR, qword3);
 		info->minor_err = FIELD_GET(IRDMA_CQ_MINERR, qword3);
@@ -1459,8 +1461,10 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 			    && FIELD_GET(IRDMA_CQMAJERR_HIGH_NIBBLE, info->major_err)
 			    == IRDMA_CIE_SIGNATURE) {
 				info->error = 0;
-				info->major_err = 0;
-				info->minor_err = 0;
+				/* Mask the actual completion error, but pass
+				 * the vendor error codes through to allow for
+				 * explicit UD TX drop notification.
+				 */
 				info->comp_status = IRDMA_COMPL_STATUS_SUCCESS;
 			} else {
 				info->comp_status = IRDMA_COMPL_STATUS_UNKNOWN;
